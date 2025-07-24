@@ -4,12 +4,10 @@ from click import prompt
 from langchain_core.runnables import RunnableLambda
 from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, MessagesState
-from langgraph_reflection import create_reflection_graph
-from langgraph.graph import START, END
+from langgraph.graph import END
 from typing import TypedDict
-import logging
 from pydantic import BaseModel, Field
-from sympy.abc import lamda
+
 from utils import parse_pddl_output
 
 
@@ -25,18 +23,18 @@ class ReflectionState(TypedDict):
     last_planner_output: str
     suggested_fix: str
     attempts: int
+    plan: list[str]
 
-def run_planner(domain: str, problem: str) -> tuple[str, bool]:
+def run_planner(domain: str, problem: str) -> tuple[str, bool, list[str]]:
     """
     Run the planner on the given PDDL files and return the output.
 
     Args:
-        domain_path (str): Path to the domain PDDL file.
-        problem_path (str): Path to the problem PDDL file.
+        :param problem:
+        :param domain:
 
     Returns:
-        (str, Bool): Output from the planner, True if a solution was found, False otherwise.
-
+        (str, Bool, list[str]): Output from the planner, True if a solution was found, False otherwise, list of actions to reach the goal.
     """
     import subprocess
 
@@ -61,18 +59,26 @@ def run_planner(domain: str, problem: str) -> tuple[str, bool]:
     os.remove(domain_path)
     os.remove(problem_path)
     os.rmdir('temp')
-    return result.stdout, 'translate exit code: 0' in result.stdout or int(result.returncode) in [0,1,2,3]
+    solution_found = False
+    plan = []
+    if os.path.isfile('sas_plan'):
+        solution_found = True
+        with open('sas_plan', 'r') as plan_file:
+            plan = [line.strip() for line in plan_file][:-1]
+
+    return result.stdout, solution_found, plan
 
 def validate_node(state: ReflectionState):
     """
     Validate the PDDL domain and problem.
     """
     print('='*50 + f"\nReflection Agent - Validating for the {state['attempts']}-th time")
-    output, valid = run_planner(state['pddl_domain'], state['pddl_problem'])
+    output, valid, plan = run_planner(state['pddl_domain'], state['pddl_problem'])
     print(f"Reflection Agent - Planner Output: {output}")
     print(f"Reflection Agent - {'No valid solution found' if not valid else 'Valid solution found'}")
     state['last_planner_output'] = output
     state['pddl_valid'] = valid
+    state['plan'] = plan
     return state
 
 def reflect_node(state: ReflectionState):
@@ -135,6 +141,7 @@ just write the PDDL code, no additional text or explanations except for PDDL com
 
 def build_reflection_graph(max_attempts: int = 3):
     graph = StateGraph(ReflectionState)
+
     graph.add_node("validate", RunnableLambda(validate_node))
     graph.add_node("reflect", RunnableLambda(reflect_node))
     graph.add_node("apply_fix", RunnableLambda(apply_fix_node))
