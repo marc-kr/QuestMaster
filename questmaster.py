@@ -1,7 +1,7 @@
 import streamlit as st
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_ollama import ChatOllama
-from models import TextualQuestDescriptionOutput
+from models import TextualQuestDescriptionOutput, PDDLAction
 
 INIT_STATE = {
     'lore': None,
@@ -12,11 +12,12 @@ INIT_STATE = {
     'quest_goal_accepted': False,
     'prompts': [],
     'quest_textual_description_accepted': False,
+    'pddl': None
 }
 
 st.set_page_config(
     page_title='QuestMaster',
-    layout='centered',
+    layout='wide',
     page_icon='⚔️'
 )
 
@@ -78,6 +79,18 @@ def handle_quest_goal_generation():
         add_message('assistant', f"Here is the updated quest goal based on your feedback:\n\n> {st.session_state['quest_goal']}")
         st.session_state['prompts'].append(AIMessage(content=st.session_state['quest_goal']))
         st.rerun()
+def format_pddl_objects():
+    objects_dict = {}
+    pddl_objects = []
+    for entity in st.session_state['textual_quest_description'].entities:
+        entity_class = entity.type.lower().split(' ')[0]  # Get the first word of the type as the class
+        if entity_class not in objects_dict:
+            objects_dict[entity_class] = []
+        objects_dict[entity_class].append(entity.name.lower().replace(' ', '_'))  # Ci va _ o -?
+    for obj_class in objects_dict.keys():
+        pddl_objects.append(f"{' '.join(objects_dict[obj_class])} - {obj_class}")
+    pddl_objects = "(:types\n\t" + "\n\t".join(pddl_objects) + "\n)\n"
+    return pddl_objects
 
 def handle_quest_description_interaction():
     if not st.session_state['quest_goal_accepted']:
@@ -139,19 +152,19 @@ def handle_quest_description_interaction():
                 content=f"Quest Description: {st.session_state['quest_goal']}\nLore: {st.session_state['lore']}")
         ]
         with st.chat_message('assistant'):
-            with st.spinner("I'm generating a textual description of the game including\n"
+            with st.spinner("I'm generating a game design document that includes:\n"
                     '* the quest goal\n'
                     '* the starting state\n'
                     '* the set of entities in the game\n'
-                    '* the set of actions that can be performed by the player\n'):
-                #print(f"Generating quest description with prompts: {st.session_state['prompts']}")
+                    '* the set of actions that can be performed by the player\n\nPlease read the description carefully and provide feedback if needed.'):
 
                 llm = ChatOllama(model='gemma3', temperature=.3).with_structured_output(TextualQuestDescriptionOutput)
                 result = llm.invoke(st.session_state['prompts'])
                 print(f"Response: {result}")
                 st.session_state['textual_quest_description'] = result.__str__()
                 add_message('assistant',
-                            f"Here is the quest description I generated:\n\n{st.session_state['textual_quest_description']}")
+                            f"Here is the quest description I generated:\n\n"
+                            f"{st.session_state['textual_quest_description']}")
                 st.session_state['prompts'].append(AIMessage(content=st.session_state['textual_quest_description']))
             st.rerun()
 
@@ -159,21 +172,51 @@ def handle_quest_description_interaction():
     if not st.session_state['quest_textual_description_accepted']:
         feedback = st.chat_input("Do you like the quest description? If not, please provide feedback for improvement.")
     if st.button('Accept quest description'):
-        st.session_state['textual_quest_description_accepted'] = True
+        st.session_state['quest_textual_description_accepted'] = True
         st.session_state['prompts'] = []
     if feedback:
         add_message('human', feedback)
         st.session_state['prompts'].append(HumanMessage(content=feedback))
         with st.spinner("Generating updated quest description..."):
             llm = ChatOllama(model='gemma3', temperature=.3).with_structured_output(TextualQuestDescriptionOutput)
-            st.session_state['textual_quest_description'] = llm.invoke(st.session_state['prompts']).__str__()
+            st.session_state['textual_quest_description'] = llm.invoke(st.session_state['prompts'])
         add_message('assistant',
-                    f"Here is the updated quest description based on your feedback:\n\n {st.session_state['textual_quest_description']}")
-        st.session_state['prompts'].append(AIMessage(content=st.session_state['textual_quest_description']))
+                    f"Here is the updated quest description based on your feedback:\n\n {st.session_state['textual_quest_description'].__str__()}")
+        st.session_state['prompts'].append(AIMessage(content=st.session_state['textual_quest_description'].__str__()))
         st.rerun()
 
 def handle_pddl_generation():
-    return
+    if st.session_state['quest_textual_description_accepted'] and not st.session_state['pddl']:
+        with st.chat_message('assistant'):
+            with st.spinner("Generating PDDL domain and problem..."):
+                llm = ChatOllama(model='qwen2.5-coder:7b', temperature=.1, num_predict=-1)
+                prompt = [
+                    SystemMessage(content="You are an expert in PDDL (Planning Domain Definition Language)."
+                                          "Given a game design document, you will generate a PDDL domain and problem."),
+                    HumanMessage(content=f"Generate a PDDL domain and problem based on the following game design document:\n\n{st.session_state['textual_quest_description']}")
+                ]
+                response = llm.invoke(prompt).content
+                print(response)
+                st.session_state['pddl'] = response
+                add_message('assistant', response)
+                st.rerun()
+
+def handle_pddl_generation1():
+    if st.session_state['quest_textual_description_accepted']:
+        with st.chat_message('assistant'):
+            with st.spinner("Generating PDDL domain and problem..."):
+                return
+
+def handle_validation_interaction():
+    if st.session_state['pddl']:
+        container = st.container(border=True)
+        col_pddl, col_interaction = container.columns(2)
+        with col_pddl:
+            st.markdown(f"### PDDL Domain and Problem\n{st.session_state['pddl']}")
+        with col_interaction:
+            st.markdown("### PDDL assistant")
+            feedback = st.chat_input("Provide your feedback on the suggestions or make your own suggestions for the PDDL domain and problem.")
+
 
 def handle_html_generation():
     return
@@ -199,5 +242,6 @@ for msg in st.session_state['chat_history']:
 handle_quest_goal_generation()
 handle_quest_description_interaction()
 handle_pddl_generation()
+handle_validation_interaction()
 handle_html_generation()
 
