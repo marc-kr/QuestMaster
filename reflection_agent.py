@@ -2,18 +2,17 @@ import os
 
 from langchain_core.runnables import RunnableLambda
 from langchain_ollama import ChatOllama
-from langgraph.graph import StateGraph
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, SystemMessage
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import StateGraph, END
 
-from langgraph.graph import END
 from typing import TypedDict, Callable
 
 from pydantic import BaseModel, Field
 
 from pddl_utils import compute_states_transitions
 
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, SystemMessage
 
-FAST_DOWNWARD_PATH = ''
 
 FAST_DOWNWARDS_EXIT_CODES = {
     0: "All run components successfully terminated (translator: completed, search: found a plan, validate: validated a plan)",
@@ -51,11 +50,11 @@ class ReflectionState(TypedDict):
     attempts: int
     user_feedback: str
     plan: list[str]
-
+    user_chat: list[BaseMessage]
 
 class PDDLReflectionAgent:
     def __init__(self,
-                 user_input_callback: Callable[[str], str],
+                 user_input_callback: Callable[[str], None],
                  success_callback: Callable[[list[str]], None] = None,
                  pddl_update_callback: Callable[[str, str], None] = None,
                  planner_update_callback: Callable[[str], None] = None,
@@ -75,6 +74,7 @@ class PDDLReflectionAgent:
         self.pddl_update_callback = pddl_update_callback if pddl_update_callback else lambda domain, problem: None
         self.planner_update_callback = planner_update_callback if planner_update_callback else lambda output: None
         self.reflection_graph = self.build_reflection_graph(max_attempts)
+        self.thread = None
 
     def validate_node(self, state: ReflectionState):
         """
@@ -93,10 +93,24 @@ class PDDLReflectionAgent:
         return state
 
     def reflect_node(self, state: ReflectionState):
+        llm = ChatOllama(model="qwen2.5-coder:7b", temperature=0.1)
+        prompt = f"""Analyze the following PDDL planner output and extract the information that is strictly needed to address the found issues.
+        Ignore all info messages and focus on errors and warnings.\n
+        Please focus on exit code, here are the meanings of the exit codes:
+            - 10 to 12: The goal is not reachable though the PDDL code is syntactically correct. This suggests that there are some issues in the logic of the PDDL code.
+            - 30 to 37: The PDDL code is syntactically incorrect. This suggests that there are some syntax errors in the PDDL code.
+                \n\n**Planner Output:**\n{state['last_planner_output']}."""
+        issue_analysis = llm.invoke(prompt).content
+
+        print(f"Reflection Agent - Issue Analysis:\n{issue_analysis}")
+
         print("Reflection Agent - No valid solution found, reflecting on the failure")
-        advice = reflect_on_failure(state['pddl_domain'], state['pddl_problem'], state['last_planner_output'])
+        state['user_chat'].append(HumanMessage(content=f"The following PDDL Code:\n\n***PDDL Domain***\n{state['pddl_domain']}\n\n***PDDL Problem***\n{state['pddl_problem']}\n\nCaused the following issues:\n{issue_analysis}"))
+        response = llm.invoke(state['user_chat']).content
+        state['user_chat'].append(AIMessage(content=response))
+        #advice = reflect_on_failure(state['pddl_domain'], state['pddl_problem'], state['last_planner_output'])
         #print('=' * 50 + f"\nReflection Agent - Suggested Fix: {advice}")
-        state['suggested_fix'] = advice
+        state['suggested_fix'] = response
 
         return state
 
@@ -106,26 +120,29 @@ class PDDLReflectionAgent:
 
     def user_input_node(self, state: ReflectionState):
         print("Waiting for user input to apply the suggested fix")
-        state['user_feedback'] = self.user_input_callback(state['suggested_fix'])
-        print(f"Reflection Agent - User feedback: {state['user_feedback']}")
+        self.user_input_callback(state['suggested_fix'])
+
         return state
 
     def suggestion_refinement_node(self, state: ReflectionState):
         llm = ChatOllama(model='gemma3', temperature=.1)
+        print(f"Reflection Agent - Evaluating user feedback: {state['user_feedback']}")
         prompt = f"""Given the following AI message:\n{state['suggested_fix']}\n\nAnd the user feedback:\n{state['user_feedback']}\n\nDecide whether the user accepts the suggested fix or want to refine it based on its feedback. Expected output:\n'accept' or 'refine'."""
         response = llm.invoke(prompt).content.strip().lower()
         print("Reflection Agent - User response to suggestion:", response)
 
         if response == 'accept':
             state['user_feedback'] = ''
-            state['chat_history'] = [SystemMessage(content='You are an assistant helping a PDDL expert. Basically, you are the navigator in a pair programming approach. You will analyze PDDL code and issues stated by the planner and eventually refine your suggestions based on user feedback.')]
+            state['user_chat'] = state['user_chat'][:1]
         return state
 
     def elaborate_user_feedback_node(self, state: ReflectionState):
-        print("Regenerating suggestion based on user feedback...")
-        prompt = f"""Based on the following AI message:\n{state['suggested_fix']}\n\nAnd the user feedback:\n{state['user_feedback']}\n\nPlease refine your suggestion based on the user feedback. Be clear and concise in your suggestions, as they will be used by a PDDL expert to fix the code. Don't output the whole PDDL code, the driver will handle that."""
+        print("="*200)
+        print("Reflection Agent - Regenerating suggestion based on user feedback...")
+        print(f"Reflection Agent - User feedback: {state['user_feedback']}")
+        state['user_chat'].append(HumanMessage(content=state['user_feedback']))
         llm = ChatOllama(model="qwen2.5-coder:7b", temperature=0.1, num_predict=-1)
-        refined_suggestion = llm.invoke(prompt).content
+        refined_suggestion = llm.invoke(state['user_chat']).content
         print(f"Reflection Agent - New suggestion based on user feedback: {refined_suggestion}")
         state['suggested_fix'] = refined_suggestion
 
@@ -160,11 +177,14 @@ class PDDLReflectionAgent:
         graph.add_edge("user_input", "suggestion_refinement_router")
         graph.add_conditional_edges("suggestion_refinement_router",
                                     path=lambda s: "elaborate_user_feedback" if s['user_feedback'] else "apply_fix")
-        #graph.add_edge('user_input', 'elaborate_user_feedback')
-        #graph.add_edge('elaborate_user_feedback', 'apply_fix')
+        #graph.add_conditional_edges("user_input", path=lambda s: "apply_fix" if user_input_router(s['user_feedback'], s['suggested_fix']) == 'accept' else "elaborate_user_feedback")
+        # graph.add_edge('user_input', 'elaborate_user_feedback')
+        # graph.add_edge('elaborate_user_feedback', 'apply_fix')
         graph.add_edge("elaborate_user_feedback", "user_input")
         graph.add_edge("apply_fix", "validate")
-        return graph.compile()
+
+        memory = MemorySaver()
+        return graph.compile(checkpointer=memory, interrupt_after=['user_input'])
 
     def invoke(self, pddl_domain: str, pddl_problem: str):
         """
@@ -186,11 +206,43 @@ class PDDLReflectionAgent:
             attempts=0,
             user_feedback="",
             plan=[],
+            user_chat=[SystemMessage(content="""You are an assistant helping a PDDL expert to solve some issues.\n
+            You will receive the PDDL domain and problem code along with an analysis of the planner output.\n
+            You should analyze the code and the planner output to find the issues in the code and suggest fixes.\n
+            The planner output analysis will tell you if the issues are syntax related or logic related.\n
+            In the case of syntax errors, you should focus on syntax errors (like missing parentheses, typos etc.)\n
+            In the case of logic errors, you should analyze the code as follows:\n
+                1. Identify all the goal predicates.\n
+                2. If some goal predicates don't appear in the effects of any action, report them.
+                3. If any action that have goal predicates in their effects has unsatisfiable preconditions (either directly from the initial state or as effects of other actions), report the action.\n
+            Guidelines:
+                - Be clear and concise in your suggestions.
+                - You can output PDDL snippets to illustrate your suggestions, but don't output the whole PDDL code.
+            The user will provide feedback on your suggestions that will help you refine them.\n
+            Your final output will be provided to a PDDL expert who will apply your suggestions to the PDDL code.\n
+            """)]
         )
         print(f"Reflection Agent - Initial PDDL:\nDomain: {state['pddl_domain']}\nProblem: {state['pddl_problem']}")
-        result = self.reflection_graph.invoke(state)
-        return result['pddl_domain'], result['pddl_problem']
+        self.thread = {'configurable': {'thread_id': '1'}}
 
+        for event in self.reflection_graph.stream(state, self.thread, stream_mode='values'):
+            # print(event)
+            continue
+        # result = self.reflection_graph.invoke(state)
+        # return result['pddl_domain'], result['pddl_problem']
+
+    def resume(self, user_input):
+        snapshot = self.reflection_graph.get_state(self.thread)
+        print(f"Reflection Agent - Resuming with user input: {user_input}")
+        snapshot.values['user_feedback'] = user_input
+        self.reflection_graph.update_state(self.thread, snapshot.values, as_node='user_input')
+
+        for event in self.reflection_graph.stream(None, self.thread, stream_mode='values'):
+            #print(event)
+            continue
+
+    def get_result(self):
+        return self.reflection_graph.get_state(self.thread)
 
 def run_planner(domain: str, problem: str) -> tuple[str, bool, list[str]]:
     """
@@ -232,8 +284,7 @@ def run_planner(domain: str, problem: str) -> tuple[str, bool, list[str]]:
         solution_found = True
         with open('sas_plan', 'r') as plan_file:
             plan = [line.strip() for line in plan_file][:-1]
-    print(f"Planner Output in Run Planner:\n{result.stdout}")
-    print(f"Planner Error: {result.stderr}")
+
     return (f"{result.stdout}\n**EXIT CODE {result.returncode}: {FAST_DOWNWARDS_EXIT_CODES[result.returncode] 
     if result.returncode in FAST_DOWNWARDS_EXIT_CODES.keys() 
     else ''}**",
@@ -252,6 +303,7 @@ Please focus on exit code, here are the meanings of the exit codes:
 
     issue_analysis = llm.invoke(prompt).content
     print(f"Reflection Agent - Issue Analysis:\n{issue_analysis}")
+
     prompt = f"""You are an assistant that helps a PDDL expert to fix PDDL code. You are assuming the role of the navigator in a pair programming approach.\n 
     The following PDDL Code:
 ***PDDL Domain***\n{pddl_domain}\n\n
@@ -260,8 +312,14 @@ Caused the following issues:\n{issue_analysis}\n\n
 Please analyze the issues and the code provided and suggest actions to fix the PDDL code.
 Issues can be syntax related or logic related.
 In case of syntax errors, suggest the correct syntax to fix the code.
-In case of logic errors, focus on the logic of the PDDL code and search for possible causes that causes the planner to fail in finding a path from the initial state to the goal. For example, there can be a predicate in the goal that is not in the effects of any action, or an action essential for reaching the goal that has a precondition not present in any effect of other actions.
-Be clear and concise in your suggestions, as they will be used by a PDDL expert to fix the code. Don't output the whole PDDL code, the driver will handle that.
+In case of logic errors analyze the code as follows:
+1. Identify all the goal predicates.
+2. Check if each goal predicate appears in the effects of any action.
+    - If not, this means the goal is not reachable, so suggest to add an action that makes the predicate true or add the predicate as an effect of an existing action.
+3. For each action that can make a goal predicate true, check if the preconditions can be satisfied either directly by the initial state or by other actions.
+4. Try to build a causal hain from the initial state to the goal state. If no such chain exists, identify where it breaks.
+
+Output the analysis followed by clear and concise indication on how to fix them. You suggestions will be given to a PDDL expert who will apply them to the code. Don't output the PDDL code, just the suggestions along with PDDL snippets if needed.
 """
     return llm.invoke(prompt).content
 
@@ -269,39 +327,52 @@ Be clear and concise in your suggestions, as they will be used by a PDDL expert 
 def apply_fix(pddl_domain: str, pddl_problem: str, suggested_fix: str) -> PDDLOutput:
     llm = ChatOllama(model="qwen2.5-coder:7b", temperature=0.1, num_predict=-1).with_structured_output(PDDLOutput)
     prompt = f"""
-    You are a PDDL expert assuming the role of the driver in a pair programming approach. Given the following PDDL domain and problem.
-
-PDDL domain:
-{pddl_domain}
-
-PDDL problem:
-{pddl_problem}
-
-the driver has suggested the following fix to the PDDL code:
-{suggested_fix}
-
-Follow the driver's suggestions and just output the updated PDDL domain and problem. Please keep the original format of the PDDL code, including comments and formatting.
+    You are a PDDL expert assuming the role of the driver in a pair programming approach.\n
+    Given the following PDDL domain and problem.\n
+    PDDL domain:\n{pddl_domain}\n\nPDDL problem:\n{pddl_problem}\n\nthe driver has suggested the following fix to the PDDL code:\n{suggested_fix}\n\n
+    Follow the driver's suggestions and just output the updated PDDL domain and problem. Be sure to keep the original format of the PDDL code, including comments and formatting.
 """
     print("="*200)
     print(f"Apply fix prompt:\n{prompt}")
     output = llm.invoke(prompt)
 
-
     return output
 
-def compute_transitions(domain: str, problem: str) -> dict:
-    domain_path = 'temp/domain.pddl'
-    problem_path = 'temp/problem.pddl'
-    if not os.path.isdir('temp'):
-        os.mkdir('temp')
-    with open(domain_path, 'w') as domain_file, open(problem_path, 'w') as problem_file:
-        domain_file.write(domain)
-        problem_file.write(problem)
 
-    transitions = compute_states_transitions(domain_path, problem_path)
+if __name__ == "__main__":
+    reflection_agent = None
+    with open('./testing/pddl_tests/save-the-galactic-ambassador-domain.pddl', 'r') as domain_file, open(
+            './testing/pddl_tests/save-the-galactic-ambassador-problem.pddl', 'r') as problem_file:
+        domain_str = domain_file.read()
+        problem_str = problem_file.read()
 
-    os.remove(domain_path)
-    os.remove(problem_path)
-    os.rmdir('temp')
 
-    return transitions
+    def user_input(msg):
+        print("Message from the assistant:", msg)
+        usr_in = input(
+            "Please provide your feedback on the suggestions or make your own suggestions. Tell me if the suggestions are ok and I will apply them: ")
+        reflection_agent.resume(usr_in)
+
+
+    def success_callback(plan: list[str]):
+        print("=" * 100)
+        print("Success! The plan is:")
+        for i, step in enumerate(plan):
+            print(f"{i}) {step}")
+        print("=" * 100)
+        print(f"PDDL Domain:\n{domain_str}\n\nPDDL Problem:\n{problem_str}")
+
+    def pddl_update(domain: str, problem: str):
+        print("=" * 200)
+        print("***PDDL Domain updated:")
+        print(domain)
+        print("***PDDL Problem updated:")
+        print(problem)
+
+    def planner_update(output: str):
+        print("=" * 200)
+        print("Planner output updated:")
+        print(output)
+    reflection_agent = PDDLReflectionAgent(user_input_callback=user_input, planner_update_callback=planner_update,
+                                           success_callback=success_callback, pddl_update_callback=pddl_update, max_attempts=10)
+    reflection_agent.invoke(domain_str, problem_str)
